@@ -1,0 +1,75 @@
+.player-screen {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  background: #000;
+  overflow: hidden;
+}
+
+#player-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.player-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 24px 32px;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.65) 0%, transparent 22%, transparent 68%, rgba(0, 0, 0, 0.75) 100%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+}
+
+.player-overlay.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.player-top {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.player-channel-name {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.player-channel-category {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  letter-spacing: 1px;
+}
+
+.player-bottom {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.player-channel-row {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.player-channel-row::-webkit-scrollbar {
+  display: none;
+}
+
+.player-channel-row channel-card .channel-card {
+  min-width: 90px;
+  padding: 10px 6px;
+}
+
+.player-channel-row channel-card.active .channel-card {
+  outline: 2px solid var(--color-accent);
+}

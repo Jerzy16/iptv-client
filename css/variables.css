@@ -1,0 +1,20 @@
+:root {
+  --color-bg: #0a0e17;
+  --color-bg-elevated: #12161f;
+  --color-bg-card: #1a2942;
+  --color-primary: #4a5f8a;
+  --color-primary-hover: #5b71a0;
+  --color-accent: #4a7bd4;
+  --color-text: #ffffff;
+  --color-text-muted: #8a93a6;
+  --color-text-dim: #5a6478;
+  --color-error: #ff6b6b;
+  --color-border: rgba(255, 255, 255, 0.08);
+
+  --font-family: 'Segoe UI', Roboto, Arial, sans-serif;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 24px;
+
+  --focus-ring: 2px solid var(--color-accent);
+}
