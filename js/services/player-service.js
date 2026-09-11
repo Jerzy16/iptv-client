@@ -11,6 +11,7 @@ export async function attachStream(videoElement, streamUrl) {
     return new Promise((resolve, reject) => {
       let settled = false;
       let mediaRecoveryAttempts = 0;
+      let networkRecoveryAttempts = 0;
       currentHls = new Hls({
         enableWorker: false,
         maxBufferLength: 10,
@@ -41,18 +42,27 @@ export async function attachStream(videoElement, streamUrl) {
       });
 
       currentHls.on(Hls.Events.ERROR, (event, data) => {
-        console.error('[Player] HLS error', {
+        const recoverableBufferHole = data.details === 'bufferSeekOverHole' && !data.fatal;
+        const log = recoverableBufferHole ? console.warn : console.error;
+        log('[Player] HLS error', {
           type: data.type,
           details: data.details,
           fatal: data.fatal,
           response: data.response,
           error: data.error
         });
+        if (recoverableBufferHole) return;
         if (data.fatal) {
           switch (data.type) {
             case Hls.ErrorTypes.NETWORK_ERROR:
-              console.warn('[Player] Error de red, reintentando HLS...');
-              currentHls.startLoad();
+              if (networkRecoveryAttempts < 2) {
+                networkRecoveryAttempts += 1;
+                console.warn('[Player] Error de red, reintentando HLS...');
+                currentHls.startLoad();
+              } else {
+                if (!settled) reject(new Error(`HLS ${data.details || 'networkError'}`));
+                detachStream(videoElement);
+              }
               break;
             case Hls.ErrorTypes.MEDIA_ERROR:
               if (mediaRecoveryAttempts < 1) {

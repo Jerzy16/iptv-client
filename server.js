@@ -8,6 +8,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
+const { execFileSync } = require('child_process');
 
 const app = express();
 const PORT = 8080;
@@ -19,6 +20,8 @@ const IPTV_HOST = '192.168.200.6';
 const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
 const TRANSCODE_ROOT = path.join(os.tmpdir(), 'figo-iptv-hls');
 const transcodes = new Map();
+let transcodeRequestId = 0;
+let transcodeOperation = Promise.resolve();
 
 fs.mkdirSync(TRANSCODE_ROOT, { recursive: true });
 
@@ -59,13 +62,45 @@ function safeFileName(value) {
   return value.split(/[\\/]/).pop();
 }
 
-function startTranscode(upstreamUrl) {
+function stopTranscode(state) {
+  if (!state) return Promise.resolve();
+  transcodes.delete(state.key);
+  if (state.process.exitCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    state.process.once('close', resolve);
+    if (process.platform === 'win32') {
+      try {
+        execFileSync('taskkill', ['/PID', String(state.process.pid), '/T', '/F'], { windowsHide: true });
+      } catch {
+        state.process.kill();
+      }
+    } else {
+      state.process.kill('SIGTERM');
+    }
+    setTimeout(resolve, 3000);
+  });
+}
+
+async function stopOtherTranscodes(activeKey) {
+  await Promise.all([...transcodes.values()]
+    .filter((state) => state.key !== activeKey)
+    .map((state) => stopTranscode(state)));
+}
+
+async function startTranscode(upstreamUrl, includeAudio = true) {
+  const operation = transcodeOperation.then(() => startTranscodeInternal(upstreamUrl, includeAudio));
+  transcodeOperation = operation.catch(() => {});
+  return operation;
+}
+
+async function startTranscodeInternal(upstreamUrl, includeAudio = true) {
   const key = transcodeKey(upstreamUrl);
   const outputDir = path.join(TRANSCODE_ROOT, key);
   const playlistPath = path.join(outputDir, 'index.m3u8');
   const existing = transcodes.get(key);
   if (existing) return existing;
 
+  await stopOtherTranscodes(key);
   fs.rmSync(outputDir, { recursive: true, force: true });
   fs.mkdirSync(outputDir, { recursive: true });
   const proxiedInputUrl = `http://127.0.0.1:${PORT}/stream-proxy?streamUrl=${encodeURIComponent(upstreamUrl.href)}`;
@@ -74,12 +109,14 @@ function startTranscode(upstreamUrl) {
     '-user_agent', 'VLC/3.0.18',
     '-http_persistent', '0',
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-    '-fflags', '+genpts', '-i', proxiedInputUrl,
-    '-map', '0:v:0', '-map', '0:a:0?',
+    '-analyzeduration', '10M', '-probesize', '50M', '-fpsprobesize', '200',
+    '-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err',
+    '-i', proxiedInputUrl,
+    '-map', '0:v:0', ...(includeAudio ? ['-map', '0:a:0?'] : []),
     '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
-    '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-level', '4.0',
+    '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-level', '4.1', '-r', '25',
     '-b:v', '2500k', '-maxrate', '2800k', '-bufsize', '5000k',
-    '-c:a', 'libmp3lame', '-b:a', '128k', '-ac', '2', '-ar', '44100',
+    ...(includeAudio ? ['-c:a', 'libmp3lame', '-b:a', '128k', '-ac', '2', '-ar', '44100', '-af', 'aresample=async=1:first_pts=0'] : []),
     '-avoid_negative_ts', 'make_zero',
     '-f', 'hls', '-hls_segment_type', 'mpegts',
     '-hls_time', '3', '-hls_list_size', '10',
@@ -88,12 +125,19 @@ function startTranscode(upstreamUrl) {
     playlistPath
   ], { windowsHide: true });
 
-  const state = { key, outputDir, playlistPath, process: ffmpeg };
+  const state = { key, outputDir, playlistPath, process: ffmpeg, error: null, includeAudio };
   transcodes.set(key, state);
   ffmpeg.stderr.on('data', (data) => console.warn(`[FFmpeg ${key}] ${data.toString().trim()}`));
+  ffmpeg.on('error', (error) => {
+    state.error = error;
+    transcodes.delete(key);
+  });
   ffmpeg.on('close', (code) => {
     transcodes.delete(key);
-    if (code !== 0) console.error(`[FFmpeg ${key}] terminó con código ${code}`);
+    if (code !== 0 && !state.error) {
+      state.error = new Error(`FFmpeg terminó con código ${code}`);
+      console.error(`[FFmpeg ${key}] terminó con código ${code}`);
+    }
   });
   return state;
 }
@@ -103,11 +147,32 @@ app.get('/stream-transcode', async (req, res) => {
   if (!streamUrl) return res.status(400).send('URL de video no proporcionada');
 
   try {
+    const requestId = ++transcodeRequestId;
     const upstreamUrl = getUpstreamUrl(streamUrl);
-    const state = startTranscode(upstreamUrl);
+    let state = await startTranscode(upstreamUrl, true);
     const deadline = Date.now() + 15000;
-    while (!fs.existsSync(state.playlistPath) && Date.now() < deadline) {
+    while (!fs.existsSync(state.playlistPath) && !state.error && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    if (!fs.existsSync(state.playlistPath) && !state.includeAudio) {
+      return res.status(502).send(`FFmpeg no pudo crear el manifest transcodificado: ${state.error?.message || 'fuente inválida'}`);
+    }
+
+    if (!fs.existsSync(state.playlistPath)) {
+      if (requestId !== transcodeRequestId) return res.status(409).send('Solicitud de canal reemplazada');
+      console.warn(`[FFmpeg ${state.key}] La pista de audio no es válida; reintentando solo video.`);
+      await stopTranscode(state);
+      if (requestId !== transcodeRequestId) return res.status(409).send('Solicitud de canal reemplazada');
+      state = await startTranscode(upstreamUrl, false);
+      const fallbackDeadline = Date.now() + 15000;
+      while (!fs.existsSync(state.playlistPath) && !state.error && Date.now() < fallbackDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+
+    if (state.error) {
+      return res.status(502).send(`No se pudo abrir el canal: ${state.error.message}`);
     }
     if (!fs.existsSync(state.playlistPath)) {
       return res.status(502).send('FFmpeg no pudo crear el manifest transcodificado');
@@ -148,7 +213,7 @@ app.get('/stream-transcode-playlist/:key/index.m3u8', (req, res) => {
 });
 
 function stopTranscodes() {
-  for (const state of transcodes.values()) state.process.kill();
+  for (const state of transcodes.values()) stopTranscode(state);
 }
 
 process.on('SIGINT', () => {
@@ -171,16 +236,22 @@ app.get('/stream-proxy', async (req, res) => {
 
   try {
     const upstreamUrl = getUpstreamUrl(streamUrl);
-    const response = await axios({
-      method: 'get',
-      url: upstreamUrl.href,
-      responseType: 'arraybuffer',
-      validateStatus: () => true,
-      headers: {
-        'User-Agent': 'VLC/3.0.18',
-        Accept: '*/*'
-      }
-    });
+    let response;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      response = await axios({
+        method: 'get',
+        url: upstreamUrl.href,
+        responseType: 'arraybuffer',
+        validateStatus: () => true,
+        headers: {
+          'User-Agent': 'VLC/3.0.18',
+          Accept: '*/*',
+          Connection: 'close'
+        }
+      });
+      if (![403, 429, 500, 502, 503, 504].includes(response.status) || attempt === 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+    }
 
     if (response.status < 200 || response.status >= 300) {
       return res.status(response.status).send(`El proveedor respondió HTTP ${response.status}`);
